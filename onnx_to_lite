@@ -1,0 +1,193 @@
+# compression_project.py
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.utils.prune as prune
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import os
+import time
+import numpy as np
+import onnx
+import onnxruntime as ort
+
+# ---------------------------
+# STEP 1 – LOAD DATASET (MNIST)
+# ---------------------------
+transform = transforms.Compose([transforms.ToTensor()])
+
+train_dataset = torchvision.datasets.MNIST(root='./data', train=True, transform=transform, download=True)
+test_dataset = torchvision.datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+
+train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=1000, shuffle=True)
+test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=1000, shuffle=False)
+
+# ---------------------------
+# STEP 2 – DEFINE MODEL
+# ---------------------------
+class SimpleMLP(nn.Module):
+    def __init__(self):
+        super(SimpleMLP, self).__init__()
+        self.fc1 = nn.Linear(28*28, 300)
+        self.fc2 = nn.Linear(300, 100)
+        self.fc3 = nn.Linear(100, 10)
+
+    def forward(self, x):
+        x = x.view(-1, 28*28)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+model = SimpleMLP()
+
+# ---------------------------
+# STEP 3 – TRAIN FUNCTION
+# ---------------------------
+def train(model, loader, optimizer):
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    for data, target in loader:
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+
+def test(model, loader):
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            output = model(data)
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    acc = 100. * correct / len(loader.dataset)
+    return acc
+
+# ---------------------------
+# STEP 4 – TRAIN BASELINE MODEL
+# ---------------------------
+optimizer = optim.Adam(model.parameters())
+for epoch in range(3):
+    train(model, train_loader, optimizer)
+    acc = test(model, test_loader)
+    print(f"Epoch {epoch+1} - Accuracy: {acc:.2f}%")
+
+baseline_acc = test(model, test_loader)
+torch.save(model.state_dict(), "baseline_model.pt")
+
+# ---------------------------
+# STEP 5 – APPLY PRUNING
+# ---------------------------
+prune.l1_unstructured(model.fc1, name="weight", amount=0.3)
+prune.l1_unstructured(model.fc2, name="weight", amount=0.3)
+prune.l1_unstructured(model.fc3, name="weight", amount=0.3)
+
+# Permanently remove pruning masks
+prune.remove(model.fc1, "weight")
+prune.remove(model.fc2, "weight")
+prune.remove(model.fc3, "weight")
+
+pruned_acc = test(model, test_loader)
+print(f"After pruning - Accuracy: {pruned_acc:.2f}%")
+
+# ---------------------------
+# STEP 6 – APPLY QUANTIZATION
+# ---------------------------
+quantized_model = torch.quantization.quantize_dynamic(
+    model, {nn.Linear}, dtype=torch.qint8
+)
+quantized_acc = test(quantized_model, test_loader)
+print(f"After pruning + PyTorch quantization - Accuracy: {quantized_acc:.2f}%")
+
+# ---------------------------
+# STEP 7 – EXPORT TO ONNX (FP32 PRUNED)
+# ---------------------------
+dummy_input = torch.randn(1, 1, 28, 28)
+torch.onnx.export(
+    model, dummy_input, "model.onnx",
+    export_params=True, opset_version=12, do_constant_folding=True,
+    input_names=["input"], output_names=["output"],
+    dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}}
+)
+
+# ---------------------------
+# STEP 8 – ONNX QUANTIZATION
+# ---------------------------
+from onnxruntime.quantization import quantize_dynamic, QuantType
+quantize_dynamic("model.onnx", "model_quant.onnx", weight_type=QuantType.QInt8)
+print("ONNX quantized model saved as model_quant.onnx")
+
+# ---------------------------
+# STEP 9 – ONNX INFERENCE FUNCTION
+# ---------------------------
+def onnx_inference(model_path):
+    ort_session = ort.InferenceSession(model_path)
+    correct = 0
+    start_time = time.time()
+    for data, target in test_loader:
+        ort_inputs = {ort_session.get_inputs()[0].name: data.numpy()}
+        ort_outs = ort_session.run(None, ort_inputs)
+        preds = np.argmax(ort_outs[0], axis=1)
+        correct += (preds == target.numpy()).sum()
+    acc = 100. * correct / len(test_loader.dataset)
+    avg_time = (time.time() - start_time) * 1000 / len(test_loader.dataset)
+    return acc, avg_time
+
+onnx_acc, onnx_time = onnx_inference("model.onnx")
+onnx_quant_acc, onnx_quant_time = onnx_inference("model_quant.onnx")
+
+# ---------------------------
+# STEP 10 – TFLITE INFERENCE FUNCTION
+# ---------------------------
+def tflite_inference(model_path):
+    """
+    Run inference using TensorFlow Lite model and return accuracy + avg time.
+    """
+    import tensorflow as tf
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    correct = 0
+    start_time = time.time()
+
+    for data, target in test_loader:
+        input_data = data.numpy().astype(np.float32)
+        interpreter.set_tensor(input_details[0]["index"], input_data)
+        interpreter.invoke()
+        output_data = interpreter.get_tensor(output_details[0]["index"])
+        preds = np.argmax(output_data, axis=1)
+        correct += (preds == target.numpy()).sum()
+
+    acc = 100. * correct / len(test_loader.dataset)
+    avg_time = (time.time() - start_time) * 1000 / len(test_loader.dataset)
+    return acc, avg_time
+
+# ---------------------------
+# STEP 11 – RUN TFLITE MODEL
+# ---------------------------
+tflite_acc, tflite_time = tflite_inference("model.tflite")
+
+# ---------------------------
+# STEP 12 – RESULTS TABLE
+# ---------------------------
+size_baseline = os.path.getsize("baseline_model.pt") / 1e6
+size_onnx = os.path.getsize("model.onnx") / 1e6
+size_onnx_quant = os.path.getsize("model_quant.onnx") / 1e6
+size_tflite = os.path.getsize("model.tflite") / 1e6
+
+print("\n=== Results Table ===")
+print(f"{'Model':<35} {'Size (MB)':<12} {'Accuracy (%)':<15} {'Time (ms/sample)':<20}")
+print("-"*85)
+print(f"{'PyTorch Baseline FP32':<35} {size_baseline:<12.2f} {baseline_acc:<15.2f} {'N/A':<20}")
+print(f"{'PyTorch Pruned+Quant INT8':<35} {'-':<12} {quantized_acc:<15.2f} {'N/A':<20}")
+print(f"{'ONNX FP32':<35} {size_onnx:<12.2f} {onnx_acc:<15.2f} {onnx_time:<20.4f}")
+print(f"{'ONNX Quant INT8':<35} {size_onnx_quant:<12.2f} {onnx_quant_acc:<15.2f} {onnx_quant_time:<20.4f}")
+print(f"{'TFLite Pruned+Quant INT8':<35} {size_tflite:<12.2f} {tflite_acc:<15.2f} {tflite_time:<20.4f}")
+
